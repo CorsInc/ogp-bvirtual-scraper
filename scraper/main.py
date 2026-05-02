@@ -5,8 +5,10 @@ Usage:
     python -m scraper.main download     # Download all documents via REST API
     python -m scraper.main selenium     # Use Selenium to extract documents
     python -m scraper.main all          # Try API first, fall back to Selenium
+    python -m scraper.main csv          # Export items as CSV
 
 Environment variables:
+    OGP_DEBUG=1             Enable debug logging
     OGP_USE_SELENIUM=1      Enable Selenium-based extraction
     OGP_SELENIUM_HEADLESS=1 Run Selenium in headless mode (default: 1)
     OGP_OUTPUT_DIR=output   Output directory (default: scraper/output)
@@ -14,12 +16,14 @@ Environment variables:
     OGP_PASSWORD=...        SharePoint password
 """
 
+import csv
 import json
 import os
 import sys
 from pathlib import Path
 
 from scraper.config import OUTPUT_DIR, SECTIONS, ALTERNATIVE_LIST_NAMES
+from scraper.log import log
 from scraper.sharepoint_client import SharePointClient
 
 
@@ -29,7 +33,76 @@ def save_json(data, filename):
     path = os.path.join(OUTPUT_DIR, filename)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
-    print(f"  [OK] Saved {path}")
+    log.info("Guardado %s", path)
+    return path
+
+
+def save_csv(items, filename, fieldnames=None):
+    """Save a list of dicts as CSV."""
+    if not items:
+        log.warning("No hay datos para CSV: %s", filename)
+        return
+
+    Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+    path = os.path.join(OUTPUT_DIR, filename)
+
+    if not fieldnames:
+        fieldnames = list(items[0].keys())
+
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(items)
+
+    log.info("Guardado CSV %s (%d filas)", path, len(items))
+    return path
+
+
+def export_all_as_csv():
+    """Export all scraped data as CSVs."""
+    client = SharePointClient()
+    try:
+        log.info("Exportando datos a CSV...")
+
+        # Discover lists
+        lists = client.discover_lists()
+        if not lists:
+            log.warning("No se encontraron listas para exportar")
+            return
+
+        for lst in lists:
+            title = lst.get("Title", "")
+            if not title:
+                continue
+
+            log.info("Exportando '%s'...", title)
+            items = client.get_list_items_paged(title)
+            if not items:
+                continue
+
+            # Flatten nested dicts for CSV
+            flat_items = []
+            for item in items:
+                flat = {}
+                for k, v in item.items():
+                    if k.startswith("_"):
+                        continue
+                    if isinstance(v, dict):
+                        # Flatten one level
+                        for sk, sv in v.items():
+                            flat[f"{k}_{sk}"] = str(sv) if not isinstance(sv, (str, int, float)) else sv
+                    elif isinstance(v, list):
+                        flat[k] = json.dumps(v, ensure_ascii=False)
+                    else:
+                        flat[k] = v
+                flat_items.append(flat)
+
+            safe_name = title.replace(" ", "_").replace("/", "_").lower()
+            save_csv(flat_items, f"list_{safe_name}.csv")
+
+        log.info("Exportación CSV completada.")
+    finally:
+        client.close()
 
 
 def explore_site():
@@ -38,16 +111,16 @@ def explore_site():
     results = {}
 
     try:
-        # 1. Get site info
-        print("=== Site Info ===")
+        # 1. Site info
+        log.info("=== Información del Sitio ===")
         title = client.get_web_title()
-        print(f"  Site title: {title}")
+        log.info("Título: %s", title)
         results["site_title"] = title
 
-        # 2. Get all lists
-        print("\n=== Lists ===")
-        all_lists = client.get_lists()
-        print(f"  Found {len(all_lists)} lists total")
+        # 2. Discover lists
+        log.info("\n=== Listas ===")
+        all_lists = client.discover_lists()
+        log.info("Total listas encontradas: %d", len(all_lists))
 
         list_summary = []
         for lst in all_lists:
@@ -59,52 +132,65 @@ def explore_site():
                 "created": lst.get("Created", ""),
             }
             list_summary.append(info)
-            print(f"  - {info['title']} ({info['item_count']} items)")
+            log.info("  • %s (%s items)", info["title"], info["item_count"])
         results["lists"] = list_summary
         save_json(list_summary, "site_structure.json")
 
-        # 3. Get items from known sections + alternative list names
-        print("\n=== List Items ===")
-        all_list_names = list(SECTIONS.keys()) + ALTERNATIVE_LIST_NAMES
+        # 3. Get items from all discovered lists
+        log.info("\n=== Items por Lista ===")
         seen_names = set()
         all_items = {}
 
-        for list_name in all_list_names:
-            if list_name in seen_names:
+        for lst in all_lists:
+            title = lst.get("Title", "")
+            if not title or title in seen_names:
                 continue
-            seen_names.add(list_name)
+            seen_names.add(title)
 
-            print(f"\n  --- {list_name} ---")
-            items = client.get_list_items_paged(list_name)
+            log.info("  ─ %s ─", title)
+            items = client.get_list_items_paged(title)
             if items:
-                print(f"  Found {len(items)} items")
-                # Clean items for serialization
+                log.info("  → %d items", len(items))
                 cleaned = []
                 for item in items:
-                    clean = {}
-                    for k, v in item.items():
-                        if not k.startswith("_"):
-                            clean[k] = v
+                    clean = {k: v for k, v in item.items() if not k.startswith("_")}
                     cleaned.append(clean)
 
-                all_items[list_name] = cleaned
-                filename = f"list_{list_name.replace(' ', '_').replace('/', '_').lower()}.json"
-                save_json({"list": list_name, "items": cleaned}, filename)
+                all_items[title] = cleaned
+                safe_name = title.replace(" ", "_").replace("/", "_").lower()
+                save_json({"list": title, "items": cleaned}, f"list_{safe_name}.json")
+
+                # Also save CSV
+                flat_items = []
+                for item in cleaned:
+                    flat = {}
+                    for k, v in item.items():
+                        if isinstance(v, dict):
+                            for sk, sv in v.items():
+                                flat[f"{k}_{sk}"] = str(sv) if not isinstance(sv, (str, int, float)) else sv
+                        elif isinstance(v, list):
+                            flat[k] = json.dumps(v, ensure_ascii=False)
+                        else:
+                            flat[k] = v
+                    flat_items.append(flat)
+                if flat_items:
+                    save_csv(flat_items, f"list_{safe_name}.csv")
             else:
-                print(f"  No items or list not accessible")
-                all_items[list_name] = []
+                log.info("  → sin items o sin acceso")
+                all_items[title] = []
 
         save_json(all_items, "all_list_items.json")
 
-        # 4. Try to discover document libraries
-        print("\n=== Document Libraries ===")
-        doc_libs = [lst for lst in all_lists if str(lst.get("BaseType", "")) == "1"]
-        if not doc_libs:
-            doc_libs = [lst for lst in all_lists if lst.get("BaseType") == 1]
+        # 4. Document libraries
+        log.info("\n=== Bibliotecas de Documentos ===")
+        doc_libs = [
+            lst for lst in all_lists
+            if str(lst.get("BaseType", "")) == "1" or lst.get("BaseType") == 1
+        ]
 
         for lib in doc_libs:
             lib_title = lib.get("Title", "")
-            print(f"  Library: {lib_title} ({lib.get('ItemCount', 0)} items)")
+            log.info("  %s (%s items)", lib_title, lib.get("ItemCount", 0))
             items = client.get_list_items_paged(lib_title)
             if items:
                 files = []
@@ -123,14 +209,14 @@ def explore_site():
                                 "url": file_info,
                             })
                 if files:
-                    filename = f"library_{lib_title.replace(' ', '_').lower()}.json"
-                    save_json({"library": lib_title, "files": files}, filename)
-                    print(f"    Extracted {len(files)} files")
+                    safe_name = lib_title.replace(" ", "_").lower()
+                    save_json({"library": lib_title, "files": files}, f"library_{safe_name}.json")
+                    log.info("    → %d archivos", len(files))
 
     finally:
         client.close()
 
-    print("\nDone! All data saved to output/")
+    log.info("\n✅ Exploración completada. Datos en %s/", OUTPUT_DIR)
     return results
 
 
@@ -141,13 +227,17 @@ def download_documents(output_subdir: str = "documents"):
     Path(download_dir).mkdir(parents=True, exist_ok=True)
 
     try:
-        # Get all lists and find files
         all_lists = client.get_lists()
-        doc_libs = [lst for lst in all_lists if str(lst.get("BaseType", "")) == "1"]
-        if not doc_libs:
-            doc_libs = [lst for lst in all_lists if lst.get("BaseType") == 1]
+        doc_libs = [
+            lst for lst in all_lists
+            if str(lst.get("BaseType", "")) == "1" or lst.get("BaseType") == 1
+        ]
 
-        downloaded = 0
+        if not doc_libs:
+            log.warning("No se encontraron bibliotecas de documentos vía API.")
+            log.info("Prueba 'python -m scraper.main selenium' como alternativa.")
+
+        total = 0
         for lib in doc_libs:
             lib_title = lib.get("Title", "")
             items = client.get_list_items_paged(lib_title)
@@ -172,16 +262,16 @@ def download_documents(output_subdir: str = "documents"):
                 if not filename:
                     continue
 
-                print(f"  Downloading: {filename}")
+                log.info("Descargando: %s", filename)
                 content = client.download_file(file_url)
                 if content:
                     filepath = os.path.join(download_dir, filename)
                     with open(filepath, "wb") as f:
                         f.write(content)
-                    downloaded += 1
+                    total += 1
 
-        print(f"\nDownloaded {downloaded} files to {download_dir}/")
-        return downloaded
+        log.info("\n✅ Descargados %d archivos a %s/", total, download_dir)
+        return total
 
     finally:
         client.close()
@@ -193,15 +283,22 @@ def extract_with_selenium():
     all_documents = []
 
     try:
-        print("=== Selenium Extraction ===")
+        log.info("=== Extracción con Selenium ===")
         for section_name in SECTIONS:
-            print(f"\n--- {section_name} ---")
+            log.info("  ─ %s ─", section_name)
             docs = client.extract_with_selenium(section_name)
             all_documents.extend(docs)
-            print(f"  Found {len(docs)} documents")
+            log.info("  → %d documentos", len(docs))
 
-        save_json({"sections": list(SECTIONS.keys()), "documents": all_documents}, "selenium_documents.json")
-        print(f"\nTotal documents found: {len(all_documents)}")
+        if all_documents:
+            save_json(
+                {"sections": list(SECTIONS.keys()), "documents": all_documents},
+                "selenium_documents.json",
+            )
+            save_csv(all_documents, "selenium_documents.csv",
+                     fieldnames=["title", "url", "section"])
+
+        log.info("\n✅ Total documentos encontrados: %d", len(all_documents))
         return all_documents
 
     finally:
@@ -210,24 +307,24 @@ def extract_with_selenium():
 
 def run_all():
     """Try API first, then Selenium fallback."""
-    print("=== Phase 1: REST API Exploration ===\n")
+    log.info("=== Fase 1: API REST ===\n")
     try:
         explore_site()
     except Exception as e:
-        print(f"[ERROR] API exploration failed: {e}")
+        log.error("API exploration falló: %s", e)
 
-    print("\n=== Phase 2: Download Documents via API ===\n")
+    log.info("\n=== Fase 2: Descarga de Documentos ===\n")
     try:
         download_documents()
     except Exception as e:
-        print(f"[ERROR] API download failed: {e}")
+        log.error("Descarga falló: %s", e)
 
-    if USE_SELENIUM or os.getenv("OGP_USE_SELENIUM") == "1":
-        print("\n=== Phase 3: Selenium Extraction ===\n")
+    if os.getenv("OGP_USE_SELENIUM") == "1":
+        log.info("\n=== Fase 3: Selenium ===\n")
         try:
             extract_with_selenium()
         except Exception as e:
-            print(f"[ERROR] Selenium extraction failed: {e}")
+            log.error("Selenium falló: %s", e)
 
 
 if __name__ == "__main__":
@@ -237,6 +334,8 @@ if __name__ == "__main__":
         download_documents()
     elif mode == "selenium":
         extract_with_selenium()
+    elif mode == "csv":
+        export_all_as_csv()
     elif mode == "all":
         run_all()
     else:
