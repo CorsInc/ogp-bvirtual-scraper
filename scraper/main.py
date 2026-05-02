@@ -1,26 +1,11 @@
-"""Main entry point for OGP Biblioteca Virtual scraper."""
+"""Main entry point for OGP Biblioteca Virtual scraper via SharePoint REST API."""
 
 import json
 import os
-import time
 from pathlib import Path
 
-import requests
-from bs4 import BeautifulSoup
-
-from scraper.config import BASE_URL, HEADERS, REQUEST_DELAY, OUTPUT_DIR, SECTIONS
-from scraper.parsers import parse_main_page, parse_sharepoint_list_page
-
-
-def fetch(url: str) -> str | None:
-    """Fetch a URL with error handling."""
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=30)
-        resp.raise_for_status()
-        return resp.text
-    except requests.RequestException as e:
-        print(f"[ERROR] Failed to fetch {url}: {e}")
-        return None
+from scraper.config import LISTS_OF_INTEREST, OUTPUT_DIR, SITE_URL
+from scraper.sharepoint_client import SharePointClient
 
 
 def save_json(data: dict, filename: str):
@@ -32,101 +17,126 @@ def save_json(data: dict, filename: str):
     print(f"[OK] Saved {path}")
 
 
-def discover_sections(html: str) -> list[dict]:
-    """Discover section URLs from the main page by parsing links."""
-    soup = BeautifulSoup(html, "html.parser")
-    sections = []
-    seen_urls = set()
+def explore_site():
+    """Explore the SharePoint site structure via REST API."""
+    client = SharePointClient()
 
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        text = a.get_text(strip=True)
-        if not text or href.startswith("#") or href.startswith("javascript"):
+    # 1. Get site info
+    print("=== Site Info ===")
+    title = client.get_web_title()
+    print(f"Site title: {title}")
+
+    # 2. Get all lists
+    print("\n=== Lists ===")
+    all_lists = client.get_lists()
+    print(f"Found {len(all_lists)} lists total")
+
+    list_summary = []
+    for lst in all_lists:
+        info = {
+            "title": lst.get("Title", ""),
+            "id": lst.get("Id", ""),
+            "item_count": lst.get("ItemCount", 0),
+            "base_type": lst.get("BaseType", ""),
+            "created": lst.get("Created", ""),
+        }
+        list_summary.append(info)
+        print(f"  - {info['title']} ({info['item_count']} items)")
+
+    save_json({"site_title": title, "lists": list_summary}, "site_structure.json")
+
+    # 3. Get items from lists of interest
+    print("\n=== List Items ===")
+    all_items = {}
+    for list_name in LISTS_OF_INTEREST:
+        print(f"\n--- {list_name} ---")
+        items = client.get_list_items(list_name)
+        if items:
+            print(f"  Found {len(items)} items")
+            # Clean items for serialization
+            cleaned = []
+            for item in items:
+                clean = {}
+                for k, v in item.items():
+                    if not k.startswith("_"):
+                        clean[k] = v
+                cleaned.append(clean)
+            all_items[list_name] = cleaned
+            save_json({"list": list_name, "items": cleaned}, f"list_{list_name.replace(' ', '_').lower()}.json")
+        else:
+            print(f"  No items or list not accessible")
+            all_items[list_name] = []
+
+    save_json(all_items, "all_list_items.json")
+
+    # 4. Try to discover document libraries
+    print("\n=== Document Libraries ===")
+    doc_libs = [lst for lst in all_lists if lst.get("BaseType", 0) == 1]  # BaseType 1 = Document Library
+    for lib in doc_libs:
+        lib_title = lib.get("Title", "")
+        print(f"  Library: {lib_title} ({lib.get('ItemCount', 0)} items)")
+        items = client.get_list_items(lib_title)
+        if items:
+            files = []
+            for item in items:
+                if "File" in item and item["File"]:
+                    files.append({
+                        "name": item.get("Title", ""),
+                        "url": item["File"].get("ServerRelativeUrl", ""),
+                        "size": item["File"].get("Length", 0),
+                    })
+            if files:
+                save_json({"library": lib_title, "files": files}, f"library_{lib_title.replace(' ', '_').lower()}.json")
+                print(f"    Extracted {len(files)} files")
+
+    print("\nDone! All data saved to output/")
+    return all_items
+
+
+def download_documents(output_subdir: str = "documents"):
+    """Download all discoverable documents from the site."""
+    client = SharePointClient()
+    download_dir = os.path.join(OUTPUT_DIR, output_subdir)
+    Path(download_dir).mkdir(parents=True, exist_ok=True)
+
+    # Get all lists and find files
+    all_lists = client.get_lists()
+    doc_libs = [lst for lst in all_lists if lst.get("BaseType", 0) == 1]
+
+    downloaded = 0
+    for lib in doc_libs:
+        lib_title = lib.get("Title", "")
+        items = client.get_list_items(lib_title)
+        if not items:
             continue
 
-        full_url = href if href.startswith("http") else f"{BASE_URL}{href}"
-        if full_url in seen_urls:
-            continue
+        for item in items:
+            if "File" in item and item["File"]:
+                file_url = item["File"].get("ServerRelativeUrl", "")
+                if not file_url:
+                    continue
 
-        if "/ogp/Bvirtual/" in full_url or "bvirtualogp" in full_url:
-            seen_urls.add(full_url)
-            sections.append({
-                "text": text,
-                "url": full_url,
-            })
+                # Get filename from URL
+                filename = file_url.split("/")[-1]
+                if not filename:
+                    continue
 
-    return sections
+                print(f"  Downloading: {filename}")
+                content = client.download_file(file_url)
+                if content:
+                    filepath = os.path.join(download_dir, filename)
+                    with open(filepath, "wb") as f:
+                        f.write(content)
+                    downloaded += 1
 
-
-def scrape_all():
-    """Scrape all known sections of the Biblioteca Virtual."""
-    print(f"Starting scrape of OGP Biblioteca Virtual: {BASE_URL}")
-    results = {}
-
-    # 1. Main page
-    print("\n--- Scraping main page ---")
-    html = fetch(f"{BASE_URL}{SECTIONS['inicio']}")
-    if html:
-        data = parse_main_page(html)
-        results["inicio"] = data
-        save_json(data, "inicio.json")
-        time.sleep(REQUEST_DELAY)
-
-        # Discover more sections from main page
-        discovered = discover_sections(html)
-        print(f"  Discovered {len(discovered)} links on main page")
-        results["_discovered_links"] = discovered
-        save_json({"links": discovered}, "discovered_links.json")
-
-    # 2. Try each known section
-    for name, path in SECTIONS.items():
-        if name == "inicio":
-            continue
-
-        url = f"{BASE_URL}{path}"
-        print(f"\n--- Scraping {name}: {url} ---")
-        html = fetch(url)
-        if not html:
-            print(f"  [SKIP] Could not fetch {name}")
-            continue
-
-        data = parse_sharepoint_list_page(html, name)
-        results[name] = data
-        save_json(data, f"{name}.json")
-        print(f"  Found {len(data.get('documents', []))} documents")
-        time.sleep(REQUEST_DELAY)
-
-    # Save full report
-    save_json(results, "full_report.json")
-    print(f"\nDone! Scraped {len(results)} sections.")
-    return results
-
-
-def scrape_section(section_key: str):
-    """Scrape a single section by key."""
-    if section_key not in SECTIONS:
-        print(f"[ERROR] Unknown section '{section_key}'. Options: {list(SECTIONS.keys())}")
-        return None
-
-    url = f"{BASE_URL}{SECTIONS[section_key]}"
-    html = fetch(url)
-    if not html:
-        return None
-
-    if section_key == "inicio":
-        data = parse_main_page(html)
-    else:
-        data = parse_sharepoint_list_page(html, section_key)
-
-    save_json(data, f"{section_key}.json")
-    print(f"Found {len(data.get('documents', []))} documents in {section_key}")
-    return data
+    print(f"\nDownloaded {downloaded} files to {download_dir}/")
+    return downloaded
 
 
 if __name__ == "__main__":
     import sys
 
-    if len(sys.argv) > 1:
-        scrape_section(sys.argv[1])
+    if len(sys.argv) > 1 and sys.argv[1] == "download":
+        download_documents()
     else:
-        scrape_all()
+        explore_site()
