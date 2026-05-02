@@ -7,7 +7,6 @@ with optional Selenium fallback for JS-heavy pages.
 import json
 import time
 import xml.etree.ElementTree as ET
-from pathlib import Path
 from urllib.parse import quote, urljoin
 
 import requests
@@ -24,6 +23,7 @@ from scraper.config import (
     SHAREPOINT_USERNAME,
     USE_SELENIUM,
 )
+from scraper.log import log
 
 # Namespace map for Atom XML responses
 ATOM_NS = {
@@ -41,6 +41,7 @@ class SharePointClient:
         self.session.headers.update(HEADERS)
         self.base_url = API_URL
         self._selenium_driver = None
+        self._list_cache = None  # Cache for get_lists()
 
     # ── Selenium setup (lazy) ──────────────────────────────────────────
 
@@ -69,16 +70,15 @@ class SharePointClient:
                 options.add_argument("--disable-dev-shm-usage")
                 self._selenium_driver = Chrome(options=options)
 
-            # Perform authentication if credentials provided
             if SHAREPOINT_USERNAME and SHAREPOINT_PASSWORD:
                 self._selenium_login()
 
             return self._selenium_driver
         except ImportError:
-            print("[WARN] Selenium not installed. Install with: pip install selenium")
+            log.warning("Selenium no instalado. pip install selenium")
             return None
         except Exception as e:
-            print(f"[WARN] Failed to start Selenium: {e}")
+            log.warning("Error iniciando Selenium: %s", e)
             return None
 
     def _selenium_login(self):
@@ -88,12 +88,11 @@ class SharePointClient:
             return
 
         login_url = f"{BASE_URL}/ogp/Bvirtual/_layouts/15/Authenticate.aspx"
-        print("[SELENIUM] Logging in...")
+        log.info("Iniciando sesión en SharePoint...")
         try:
             driver.get(login_url)
             time.sleep(2)
 
-            # Try common SharePoint login form fields
             username_field = driver.find_element("id", "userName")
             password_field = driver.find_element("id", "password")
             submit_btn = driver.find_element("id", "SubmitButton")
@@ -103,13 +102,12 @@ class SharePointClient:
             submit_btn.click()
             time.sleep(3)
 
-            # Transfer cookies to requests session
             for cookie in driver.get_cookies():
                 self.session.cookies.set(cookie["name"], cookie["value"])
 
-            print("[SELENIUM] Login successful, cookies transferred.")
+            log.info("Login exitoso, cookies transferidas.")
         except Exception as e:
-            print(f"[SELENIUM] Login failed or not needed: {e}")
+            log.warning("Login falló o no era necesario: %s", e)
 
     def close(self):
         """Clean up Selenium driver if active."""
@@ -135,18 +133,17 @@ class SharePointClient:
             if "json" in ct:
                 return resp.json()
             elif "atom" in ct or "xml" in ct:
-                # Server returned XML despite Accept: json
                 return self._parse_atom_to_dict(resp.text)
+            log.debug("Content-Type inesperado: %s", ct)
             return None
         except requests.RequestException as e:
-            print(f"[WARN] JSON request failed: {url} — {e}")
+            log.debug("JSON request falló: %s — %s", url, e)
             return None
         except json.JSONDecodeError:
-            # Try parsing as Atom XML
             try:
                 return self._parse_atom_to_dict(resp.text)
             except Exception:
-                print(f"[ERROR] Could not parse response from {url}")
+                log.debug("No se pudo parsear respuesta de %s", url)
                 return None
 
     def _request_atom(self, endpoint: str) -> ET.Element | None:
@@ -159,10 +156,10 @@ class SharePointClient:
             time.sleep(REQUEST_DELAY)
             return ET.fromstring(resp.content)
         except requests.RequestException as e:
-            print(f"[WARN] Atom request failed: {url} — {e}")
+            log.debug("Atom request falló: %s — %s", url, e)
             return None
         except ET.ParseError as e:
-            print(f"[ERROR] XML parse error: {e}")
+            log.debug("XML parse error: %s", e)
             return None
 
     def _request(self, endpoint: str) -> dict | None:
@@ -171,7 +168,6 @@ class SharePointClient:
         if result is not None:
             return result
 
-        # Fallback: try Atom XML
         root = self._request_atom(endpoint)
         if root is not None:
             return self._parse_atom_to_dict(ET.tostring(root, encoding="unicode"))
@@ -188,13 +184,11 @@ class SharePointClient:
         entries = root.findall("atom:entry", ATOM_NS) or root.findall("entry", ATOM_NS)
         for entry in entries:
             item = {}
-            # Get properties from m:properties
             props = entry.find(".//m:properties", ATOM_NS)
             if props is not None:
                 for child in props:
                     tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
                     text = child.text or ""
-                    # Try to parse as JSON value
                     if text.startswith("{") or text.startswith("["):
                         try:
                             item[tag] = json.loads(text)
@@ -203,7 +197,6 @@ class SharePointClient:
                     else:
                         item[tag] = text
 
-            # Get links (for file downloads etc.)
             links = entry.findall("atom:link", ATOM_NS)
             for link in links:
                 rel = link.get("rel", "")
@@ -215,7 +208,6 @@ class SharePointClient:
 
             result["d"]["results"].append(item)
 
-        # Also extract single-entry properties (for web title etc.)
         if not entries:
             props = root.find(".//m:properties", ATOM_NS)
             if props is not None:
@@ -228,15 +220,48 @@ class SharePointClient:
     # ── API methods ────────────────────────────────────────────────────
 
     def get_lists(self) -> list[dict]:
-        """Get all lists from the site."""
+        """Get all lists from the site. Results are cached."""
+        if self._list_cache is not None:
+            return self._list_cache
+
         data = self._request("lists")
         if data and "d" in data:
             results = data["d"].get("results", [])
             if not results and isinstance(data["d"], dict):
-                # Single list returned
-                return [data["d"]]
+                results = [data["d"]]
+            self._list_cache = results
             return results
+
+        self._list_cache = []
         return []
+
+    def discover_lists(self) -> list[dict]:
+        """Discover lists by trying known names and patterns.
+
+        Returns lists that actually have items.
+        """
+        all_lists = self.get_lists()
+        if all_lists:
+            log.info("API devolvió %d listas directamente", len(all_lists))
+            return all_lists
+
+        # Fallback: try each known section name as a list
+        log.info("API directa no devolvió listas. Probando nombres conocidos...")
+        discovered = []
+        for name in list(SECTIONS.keys()):
+            items = self.get_list_items(name, top=1)
+            if items:
+                discovered.append({
+                    "Title": name,
+                    "ItemCount": len(self.get_list_items(name, top=500)),
+                    "BaseType": 0,
+                    "discovered_by": "probe",
+                })
+                log.info("  ✅ %s — tiene items", name)
+            else:
+                log.debug("  ❌ %s — sin acceso", name)
+
+        return discovered
 
     def get_list_items(self, list_title: str, top: int = 500) -> list[dict]:
         """Get items from a specific list by title."""
@@ -290,13 +315,14 @@ class SharePointClient:
 
     def download_file(self, server_relative_url: str) -> bytes | None:
         """Download a file from SharePoint by its server-relative URL."""
-        url = f"{self.base_url.rsplit('/_api', 1)[0]}{server_relative_url}"
+        base = self.base_url.rsplit("/_api", 1)[0]
+        url = f"{base}{server_relative_url}"
         try:
             resp = self.session.get(url, timeout=60)
             resp.raise_for_status()
             return resp.content
         except requests.RequestException as e:
-            print(f"[ERROR] Failed to download {url}: {e}")
+            log.error("Fallo descarga %s: %s", url, e)
             return None
 
     # ── Selenium-based extraction ──────────────────────────────────────
@@ -305,54 +331,75 @@ class SharePointClient:
         """Use Selenium to extract document links from a section page."""
         driver = self._init_selenium()
         if not driver:
-            print("[SELENIUM] Not available, skipping Selenium extraction.")
+            log.warning("Selenium no disponible, saltando extracción.")
             return []
 
         section = SECTIONS.get(section_name)
         if not section:
-            print(f"[SELENIUM] Unknown section: {section_name}")
+            log.error("Sección desconocida: %s", section_name)
             return []
 
         url = section["url"]
-        print(f"[SELENIUM] Navigating to {url}...")
+        log.info("Navegando a %s ...", url)
         try:
             driver.get(url)
-            time.sleep(5)  # Let JS render
+            time.sleep(5)
 
-            # Try to find document links
             documents = []
+            seen_urls = set()
 
-            # Strategy 1: Look for file links in the page
-            links = driver.find_elements("css selector", "a[href*='.pdf'], a[href*='.doc'], a[href*='.xls'], a[href*='.pptx']")
+            # Strategy 1: File links
+            links = driver.find_elements(
+                "css selector",
+                "a[href*='.pdf'], a[href*='.doc'], a[href*='.xls'], a[href*='.pptx'], "
+                "a[href*='.docx'], a[href*='.xlsx']",
+            )
             for link in links:
                 href = link.get_attribute("href")
                 title = link.text.strip() or href.split("/")[-1]
-                if href:
+                if href and href not in seen_urls:
+                    seen_urls.add(href)
                     documents.append({
                         "title": title,
                         "url": href,
                         "section": section_name,
                     })
 
-            # Strategy 2: Look for SharePoint list view table rows
+            # Strategy 2: SharePoint list view table
             rows = driver.find_elements("css selector", "table.ms-listviewtable tr")
             for row in rows:
                 cells = row.find_elements("css selector", "td")
                 if len(cells) >= 2:
-                    link = cells[0].find_element("css selector", "a")
-                    if link:
+                    try:
+                        link = cells[0].find_element("css selector", "a")
                         href = link.get_attribute("href")
                         title = link.text.strip()
-                        if href and title:
+                        if href and title and href not in seen_urls:
+                            seen_urls.add(href)
                             documents.append({
                                 "title": title,
                                 "url": href,
                                 "section": section_name,
                             })
+                    except Exception:
+                        pass
 
-            print(f"[SELENIUM] Found {len(documents)} documents in '{section_name}'")
+            # Strategy 3: Any link with "Document" or file-like patterns
+            all_links = driver.find_elements("css selector", "a[href*='Download'], a[href*='download'], a[href*='document']")
+            for link in all_links:
+                href = link.get_attribute("href")
+                title = link.text.strip() or href.split("/")[-1]
+                if href and href not in seen_urls:
+                    seen_urls.add(href)
+                    documents.append({
+                        "title": title,
+                        "url": href,
+                        "section": section_name,
+                    })
+
+            log.info("Encontrados %d documentos en '%s'", len(documents), section_name)
             return documents
 
         except Exception as e:
-            print(f"[SELENIUM] Error extracting '{section_name}': {e}")
+            log.error("Error extrayendo '%s': %s", section_name, e)
             return []
