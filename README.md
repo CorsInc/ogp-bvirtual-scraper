@@ -1,15 +1,17 @@
-# OGP Biblioteca Virtual Scraper (SharePoint REST API)
+# OGP Biblioteca Virtual Scraper
 
-Scraper para la **Biblioteca Virtual de OGP "Miguel J. Rodríguez Fernández"** usando la API REST de SharePoint.
+Scraper para la **Biblioteca Virtual de OGP "Miguel J. Rodríguez Fernández"**.
+Extrae leyes, resoluciones y documentos presupuestarios del portal de la
+Oficina de Gerencia y Presupuesto de Puerto Rico.
 
-## ¿Cómo funciona?
+## Estrategia
 
-En lugar de hacer web scraping tradicional, este scraper usa la **API REST de SharePoint** (`_api/web/lists`) para:
+El scraper usa **dos enfoques** complementarios:
 
-1. Descubrir todas las listas y bibliotecas de documentos del sitio
-2. Extraer metadatos de cada lista (título, número de items, IDs)
-3. Obtener items y archivos de las listas de interés
-4. Descargar documentos (PDFs, Word, Excel) a tu máquina local
+1. **REST API de SharePoint** (`_api/web/lists`) — intenta obtener listas e
+   items directamente. Soporta respuestas JSON y Atom XML.
+2. **Selenium** (opcional) — para cuando el contenido requiere JavaScript o
+   autenticación. Navega las secciones y extrae enlaces a documentos.
 
 ## Instalación
 
@@ -17,30 +19,58 @@ En lugar de hacer web scraping tradicional, este scraper usa la **API REST de Sh
 pip install -r requirements.txt
 ```
 
+Para Selenium (opcional):
+```bash
+pip install selenium
+# Además necesitas ChromeDriver o GeckoDriver en el PATH
+```
+
 ## Uso
 
-### Explorar la estructura del sitio:
+### Explorar estructura del sitio vía API:
 ```bash
 python -m scraper.main
 ```
-Esto guarda JSONs con toda la estructura de listas, items y archivos en `scraper/output/`.
 
-### Descargar todos los documentos:
+### Descargar documentos vía API:
 ```bash
 python -m scraper.main download
 ```
-Esto descarga los archivos a `scraper/output/documents/`.
+
+### Extraer documentos con Selenium:
+```bash
+OGP_USE_SELENIUM=1 python -m scraper.main selenium
+```
+
+### Todo en uno (API + Selenium):
+```bash
+OGP_USE_SELENIUM=1 python -m scraper.main all
+```
+
+## Configuración (variables de entorno)
+
+| Variable | Default | Descripción |
+|---|---|---|
+| `OGP_USE_SELENIUM` | `0` | Activar Selenium |
+| `OGP_SELENIUM_HEADLESS` | `1` | Modo headless |
+| `OGP_SELENIUM_DRIVER` | `chromium` | chromium, firefox, edge |
+| `OGP_OUTPUT_DIR` | `scraper/output` | Directorio de salida |
+| `OGP_USERNAME` | — | Usuario SharePoint (auth) |
+| `OGP_PASSWORD` | — | Contraseña SharePoint |
 
 ## Output
 
 - `site_structure.json` — Listas y bibliotecas del sitio
-- `list_*.json` — Items de cada lista de interés
+- `list_*.json` — Items de cada lista/sección
 - `all_list_items.json` — Todos los items combinados
-- `library_*.json` — Archivos encontrados en bibliotecas de documentos
-- `documents/` — Archivos descargados (modo download)
+- `library_*.json` — Archivos en bibliotecas de documentos
+- `selenium_documents.json` — Documentos extraídos con Selenium
+- `documents/` — Archivos descargados (modo `download`)
 
-## Notas
+## Secciones
 
-- El sitio usa SharePoint y requiere autenticación para algunas operaciones
-- Las listas públicas deberían ser accesibles sin autenticación
-- Si una lista devuelve 0 items, puede requerir autenticación o no existir
+1. **Leyes Orgánicas** — Leyes que crean agencias y entidades gubernamentales
+2. **Leyes de Referencia** — Leyes por temas (Contabilidad, Empleos, etc.)
+3. **Reorganización Gubernamental** — Documentos de reorganización
+4. **Resoluciones Conjuntas del Presupuesto** — Presupuestos por año fiscal
+5. **Memoriales Explicativos del Presupuesto** — Documentos presupuestarios
