@@ -1,14 +1,15 @@
-# OGP Biblioteca Virtual Scraper
+# OGP Biblioteca Virtual Scraper (SharePoint REST API)
 
-Scraper para la **Biblioteca Virtual de OGP "Miguel J. Rodríguez Fernández"** — la biblioteca digital de la Oficina de Gerencia y Presupuesto de Puerto Rico.
+Scraper para la **Biblioteca Virtual de OGP "Miguel J. Rodríguez Fernández"** usando la API REST de SharePoint.
 
-## ¿Qué extrae?
+## ¿Cómo funciona?
 
-- **Leyes Orgánicas** — Leyes que crean agencias y entidades gubernamentales
-- **Leyes de Referencia** — Leyes por temas (Contabilidad, Empleos, Ética, Justicia, etc.)
-- **Reorganización Gubernamental** — Documentos de reorganización
-- **Resoluciones Conjuntas del Presupuesto** — Presupuestos por año fiscal
-- **Memoriales Explicativos del Presupuesto** — Documentos presupuestarios
+En lugar de hacer web scraping tradicional, este scraper usa la **API REST de SharePoint** (`_api/web/lists`) para:
+
+1. Descubrir todas las listas y bibliotecas de documentos del sitio
+2. Extraer metadatos de cada lista (título, número de items, IDs)
+3. Obtener items y archivos de las listas de interés
+4. Descargar documentos (PDFs, Word, Excel) a tu máquina local
 
 ## Instalación
 
@@ -18,29 +19,28 @@ pip install -r requirements.txt
 
 ## Uso
 
-### Scrapear todo:
+### Explorar la estructura del sitio:
 ```bash
 python -m scraper.main
 ```
+Esto guarda JSONs con toda la estructura de listas, items y archivos en `scraper/output/`.
 
-### Scrapear una sección específica:
+### Descargar todos los documentos:
 ```bash
-python -m scraper.main leyes_organicas
-python -m scraper.main memoriales
+python -m scraper.main download
 ```
-
-### Secciones disponibles:
-- `inicio` — Página principal
-- `leyes_organicas` — Leyes Orgánicas
-- `leyes_referencia` — Leyes de Referencia
-- `reorganizacion` — Reorganización Gubernamental
-- `resoluciones_presupuesto` — Resoluciones Conjuntas
-- `memoriales` — Memoriales Explicativos
+Esto descarga los archivos a `scraper/output/documents/`.
 
 ## Output
 
-Los resultados se guardan en `scraper/output/` como archivos JSON.
+- `site_structure.json` — Listas y bibliotecas del sitio
+- `list_*.json` — Items de cada lista de interés
+- `all_list_items.json` — Todos los items combinados
+- `library_*.json` — Archivos encontrados en bibliotecas de documentos
+- `documents/` — Archivos descargados (modo download)
 
 ## Notas
 
-El sitio está construido sobre SharePoint. Algunas secciones pueden requerir JavaScript para cargar completamente. Si una sección no devuelve documentos, prueba abriendo la URL directamente en un navegador para verificar que existe.
+- El sitio usa SharePoint y requiere autenticación para algunas operaciones
+- Las listas públicas deberían ser accesibles sin autenticación
+- Si una lista devuelve 0 items, puede requerir autenticación o no existir
